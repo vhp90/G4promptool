@@ -2049,7 +2049,8 @@ worst quality, bad quality, blurry, low resolution, deformed, bad anatomy, extra
 #  SYSTEM PROMPT ROUTER
 # ══════════════════════════════════════════════════════════════════════════
 def get_system_prompt(target_model: str, screenplay_mode: bool = False,
-                      animation_preset: str = "None") -> str:
+                      animation_preset: str = "None",
+                      transform_mode: bool = False) -> str:
     if "LTX" in target_model:
         base = SYSTEM_LTX_SCREENPLAY if screenplay_mode else SYSTEM_LTX
     elif "Wan" in target_model:
@@ -2065,8 +2066,37 @@ def get_system_prompt(target_model: str, screenplay_mode: bool = False,
     else:
         base = SYSTEM_FLUX
 
+    # ── Transform mode — vid2vid context prepended to system prompt ────
+    if transform_mode:
+        _transform_preamble = (
+            "CONTEXT — VIDEO-TO-VIDEO STYLE TRANSFORMATION:\n"
+            "The user's workflow is a VID2VID pipeline. A source video is already provided as input — "
+            "the diffusion model will transform its visual style while largely preserving motion, "
+            "composition, and structure.\n\n"
+            "YOUR ROLE: Write a prompt describing the TARGET STYLE the video should be converted into. "
+            "The user will provide a style direction (e.g. 'realistic', 'anime', 'oil painting', "
+            "'cyberpunk', 'noir cinematography') and you expand that into a rich visual description "
+            "of how the output should look.\n\n"
+            "GUIDELINES:\n"
+            "- PRIORITIZE describing the target visual style: lighting quality, colour palette, "
+            "  textures, material rendering, surface detail, atmospheric quality.\n"
+            "- You may briefly acknowledge what is in the scene (subjects, setting) to ground "
+            "  the style description, but keep it short — the focus is HOW things look, not WHAT happens.\n"
+            "- Avoid detailed motion choreography or action sequences — the source video handles that.\n"
+            "- Describe how surfaces, skin, hair, clothing, and environments should render in the target style.\n"
+            "- Be exhaustive about the target aesthetic: what does the lighting do? What texture do "
+            "  surfaces have? What is the colour temperature? What film stock or rendering technique "
+            "  does it resemble?\n"
+            "- Include quality anchors appropriate to the target style.\n"
+            "- Output a single flowing paragraph.\n\n"
+        )
+        base = _transform_preamble + base
+
     # Prepend animation style tag at the very top of system prompt
-    if animation_preset and animation_preset != "None":
+    # Skip when transform_mode is active — the user may be converting FROM
+    # an animation style TO realistic, so "Do NOT describe photorealistic"
+    # would directly conflict with the transform direction.
+    if animation_preset and animation_preset != "None" and not transform_mode:
         preset = ANIMATION_PRESETS.get(animation_preset)
         if preset:
             style_tag = preset.get("style_tag", "")
@@ -2289,6 +2319,17 @@ class Gemma4PromptGen:
                         "unspecified characters. Good for scenes with dialogue and multiple beats."
                     ),
                 }),
+                "🔄 transform_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Vid2Vid transformation mode. Enable when your workflow converts/transforms "
+                        "an existing video's style (e.g. anime → realistic, realistic → oil painting). "
+                        "When active, Gemma understands that a source video is already provided and writes "
+                        "a prompt describing the TARGET visual style rather than scene content. "
+                        "You only need to specify the desired style direction (e.g. 'convert to realistic style') "
+                        "— Gemma handles the rest. Works best with video_frames or first_frame connected."
+                    ),
+                }),
             },
             "optional": {
                 # ── IMAGE / VIDEO INPUTS ───────────────────────────────────
@@ -2437,6 +2478,7 @@ class Gemma4PromptGen:
         animation_preset  = _kw("🎭 animation_preset","animation_preset",  default="None")
         wildcards         = _kw("🎲 wildcards",       "wildcards",         default=False)
         screenplay_mode   = _kw("📝 screenplay_mode", "screenplay_mode",   default=False)
+        transform_mode    = _kw("🔄 transform_mode",  "transform_mode",    default=False)
         # optional inputs
         first_frame       = _kw("first_frame",                             default=None)
         last_frame        = _kw("last_frame",                              default=None)
@@ -2600,13 +2642,14 @@ class Gemma4PromptGen:
             _temperature_float = _temp_map.get(temperature, 1.0)
 
             # Build message
-            system_prompt = get_system_prompt(target_model, screenplay_mode, animation_preset)
+            system_prompt = get_system_prompt(target_model, screenplay_mode, animation_preset,
+                                              transform_mode=transform_mode)
             combined = self._build_message(
                 instruction, system_prompt, target_model, environment,
                 frame_count, dialogue, character, seed, image_paths,
                 screenplay_mode, pov_mode, animation_preset, energy,
                 style_preset, word_target, content_gate=content_gate,
-                image_mode=image_mode
+                image_mode=image_mode, transform_mode=transform_mode
             )
 
             # Generate
@@ -2728,9 +2771,13 @@ class Gemma4PromptGen:
     def _tensor_to_tempfile(self, image_tensor) -> str:
         """Convert a ComfyUI IMAGE tensor (B, H, W, C) to a temp JPEG for LLM context.
 
-        PNG at 1024px can be 1-2MB base64 — enough to blow Qwen's context window.
-        JPEG at 512px quality=75 is ~40-80KB base64 — safe for any local 9B model.
-        The LLM only needs to read the image for subject/scene grounding, not pixel-perfect detail.
+        Gemma 4's SigLIP vision encoder processes images into vision tokens via the
+        mmproj adapter.  Higher input resolution lets it extract finer style/texture
+        detail — important for transform-mode (vid2vid) where the LLM needs to
+        identify the source art style being converted.
+
+        768px JPEG q88 ≈ 80-150 KB per frame — good detail-to-size balance.
+        With 6 frames this is ~0.5-0.9 MB total base64, well within 32K ctx.
         """
         import numpy as np
         from PIL import Image as PILImage
@@ -2739,15 +2786,16 @@ class Gemma4PromptGen:
         arr = (frame.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         pil_img = PILImage.fromarray(arr, mode="RGB")
 
-        # 512px is plenty for the LLM to read subject/scene. 1024 PNG = context bomb.
-        max_side = 512
+        # 768px keeps fine style/texture detail the LLM needs for grounding
+        # and transform-mode style analysis without being excessively large.
+        max_side = 768
         w, h = pil_img.size
         if max(w, h) > max_side:
             scale = max_side / max(w, h)
             pil_img = pil_img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        pil_img.save(tmp.name, format="JPEG", quality=75, optimize=True)
+        pil_img.save(tmp.name, format="JPEG", quality=88, optimize=True)
         tmp.close()
         return tmp.name
 
@@ -2758,7 +2806,7 @@ class Gemma4PromptGen:
                        image_paths=None, screenplay_mode=False, pov_mode="Off",
                        animation_preset="None", energy="Intense",
                        style_preset="None", word_target=0, content_gate="Auto",
-                       image_mode="none"):
+                       image_mode="none", transform_mode=False):
         """Assemble the full prompt message for Claude Code."""
 
         parts = []
@@ -3081,7 +3129,23 @@ class Gemma4PromptGen:
                 parts.append(f"VIDEO LENGTH: {arc}\n")
 
         # Image context injection — mode-aware
-        if image_mode == "bracket":
+        # When transform_mode is active, ALL image modes get a unified transform-
+        # specific instruction instead of the normal I2V / continuation text.
+        if transform_mode and image_mode != "none":
+            n = len(image_paths) if image_paths else 0
+            parts.append(
+                f"IMAGE CONTEXT (SOURCE MATERIAL FOR STYLE TRANSFORMATION — {n} frame{'s' if n != 1 else ''}):\n"
+                f"The embedded frame{'s show' if n != 1 else ' shows'} the SOURCE video that is being style-transformed.\n"
+                "RULES:\n"
+                "- These frames represent the CURRENT look of the video BEFORE conversion.\n"
+                "- Do NOT write a prompt that continues or animates these frames.\n"
+                "- Do NOT describe the subjects' actions, motions, or scene choreography — the source video preserves those.\n"
+                "- Use the frames ONLY to understand the content being transformed: what subjects exist, what the "
+                "environment looks like, what the composition is. Then describe how all of that should LOOK in the target style.\n"
+                "- Your prompt focuses entirely on the DESTINATION visual style.\n"
+            )
+
+        elif image_mode == "bracket":
             # Two images: first frame + last frame
             if is_video_model(target_model):
                 parts.append(
@@ -3460,13 +3524,26 @@ class Gemma4PromptGen:
         else:
             word_instruction = ""
 
-        parts.append(
-            "SCENE TO WRITE A PROMPT FOR:\n"
-            + instruction
-            + word_instruction
-            + "\n\nOutput the prompt now. One paragraph. No headers. No bullets. No preamble. "
-            "The first word you write is the first word of the cinematic paragraph itself. Begin:"
-        )
+        # ── Transform mode — wrap instruction with vid2vid context ─────
+        # The full transform ruleset is already in the system prompt preamble.
+        # Here we just label the instruction as a style direction and cue output.
+        if transform_mode:
+            parts.append(
+                "TARGET STYLE DIRECTION:\n"
+                + instruction
+                + word_instruction
+                + "\n\nWrite the transformation prompt now. One paragraph. No headers. No bullets. No preamble. "
+                "Describe the target visual style in rich detail — textures, lighting quality, material rendering, "
+                "colour palette, atmospheric quality. The first word you write is the first word of the prompt. Begin:"
+            )
+        else:
+            parts.append(
+                "SCENE TO WRITE A PROMPT FOR:\n"
+                + instruction
+                + word_instruction
+                + "\n\nOutput the prompt now. One paragraph. No headers. No bullets. No preamble. "
+                "The first word you write is the first word of the cinematic paragraph itself. Begin:"
+            )
 
         return "\n".join(parts)
 
@@ -3992,7 +4069,7 @@ class Gemma4PromptGen:
             llama_exe,
             "-m", model_path,
             "-ngl", "99",
-            "--ctx-size", "12288",
+            "--ctx-size", "32768",
             "--flash-attn",
             "--reasoning-budget", "0",
         ]
