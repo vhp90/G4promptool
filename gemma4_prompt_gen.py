@@ -1631,6 +1631,9 @@ STYLE_PRESETS = {
 }
 
 STYLE_PRESET_KEYS = list(STYLE_PRESETS.keys())
+COMPAT_ENERGY_VALUES = ["True"]
+COMPAT_DIALOGUE_VALUES = ["False"]
+COMPAT_STYLE_PRESET_VALUES = [""]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2186,6 +2189,7 @@ class Gemma4PromptGen:
     _last_neg     = ""
     _last_qc      = ""
     _llama_process = None
+    _llama_log_path = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2239,7 +2243,7 @@ class Gemma4PromptGen:
                     },
                 ),
                 "⚡ energy": (
-                    ["Auto", "Fun", "Intense", "Extreme"],
+                    ["Auto", "Fun", "Intense", "Extreme"] + COMPAT_ENERGY_VALUES,
                     {
                         "default": "Intense",
                         "tooltip": (
@@ -2265,7 +2269,7 @@ class Gemma4PromptGen:
                 }),
                 # ── SCENE STYLE ────────────────────────────────────────────
                 "💬 dialogue": (
-                    ["Off", "Auto", "More", "Unleashed"],
+                    ["Off", "Auto", "More", "Unleashed"] + COMPAT_DIALOGUE_VALUES,
                     {
                         "default": "Off",
                         "tooltip": (
@@ -2277,7 +2281,7 @@ class Gemma4PromptGen:
                     },
                 ),
                 "🎨 style_preset": (
-                    STYLE_PRESET_KEYS,
+                    STYLE_PRESET_KEYS + COMPAT_STYLE_PRESET_VALUES,
                     {
                         "default": "None",
                         "tooltip": (
@@ -2466,6 +2470,25 @@ class Gemma4PromptGen:
                     return kwargs[key]
             return default
 
+        def _normalise_choice(value, valid_values, default, legacy_map=None):
+            if value is None:
+                return default
+            if legacy_map and value in legacy_map:
+                return legacy_map[value]
+            if isinstance(value, bool):
+                str_value = "True" if value else "False"
+                if legacy_map and str_value in legacy_map:
+                    return legacy_map[str_value]
+            if isinstance(value, str):
+                stripped = value.strip()
+                if legacy_map and stripped in legacy_map:
+                    return legacy_map[stripped]
+                if stripped in valid_values:
+                    return stripped
+            if value in valid_values:
+                return value
+            return default
+
         mode              = _kw("mode")
         target_model      = _kw("target_model")
         instruction       = _kw("instruction", default="")
@@ -2494,6 +2517,25 @@ class Gemma4PromptGen:
         vram_management   = _kw("🔌 vram_management", "vram_management",   default="auto_unload (safe)")
         llama_server_url  = _kw("🖥️ llama_server_url","llama_server_url",  default="http://127.0.0.1:8080")
         gguf_model        = _kw("🧠 gguf_model",      "gguf_model",        default="")
+
+        energy = _normalise_choice(
+            energy,
+            {"Auto", "Fun", "Intense", "Extreme"},
+            "Intense",
+            legacy_map={"True": "Intense"},
+        )
+        dialogue = _normalise_choice(
+            dialogue,
+            {"Off", "Auto", "More", "Unleashed"},
+            "Off",
+            legacy_map={"False": "Off"},
+        )
+        style_preset = _normalise_choice(
+            style_preset,
+            set(STYLE_PRESET_KEYS),
+            "None",
+            legacy_map={"": "None"},
+        )
 
         if not llama_server_url or not llama_server_url.strip():
             llama_server_url = "http://127.0.0.1:8080"
@@ -4070,16 +4112,19 @@ class Gemma4PromptGen:
             "-m", model_path,
             "-ngl", "99",
             "--ctx-size", "32768",
-            "--flash-attn",
+            "--flash-attn", "on",
             "--reasoning-budget", "0",
         ]
         if mmproj_path:
             cmd += ["--mmproj", mmproj_path]
 
         try:
+            log_file = tempfile.NamedTemporaryFile(prefix="gemma4_llama_", suffix=".log", delete=False)
+            log_file.close()
+            Gemma4PromptGen._llama_log_path = log_file.name
             popen_kwargs = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
+                "stdout": open(log_file.name, "ab"),
+                "stderr": subprocess.STDOUT,
             }
             if _IS_WINDOWS:
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -4103,12 +4148,31 @@ class Gemma4PromptGen:
         max_wait = 120
         waited = 0
         while waited < max_wait:
+            proc = Gemma4PromptGen._llama_process
+            if proc is not None and proc.poll() is not None:
+                tail = ""
+                if Gemma4PromptGen._llama_log_path and os.path.isfile(Gemma4PromptGen._llama_log_path):
+                    try:
+                        with open(Gemma4PromptGen._llama_log_path, "r", encoding="utf-8", errors="replace") as fh:
+                            tail = fh.read()[-1200:].strip()
+                    except Exception:
+                        tail = ""
+                suffix = f"\n{tail}" if tail else ""
+                return f"❌ llama-server exited before becoming healthy (code {proc.returncode}).{suffix}"
             if self._check_health(server_url):
                 return f"✅ llama-server started ({waited}s){' — vision enabled' if mmproj_path else ''}"
             time.sleep(2)
             waited += 2
 
-        return "❌ llama-server health check timed out after 120s"
+        tail = ""
+        if Gemma4PromptGen._llama_log_path and os.path.isfile(Gemma4PromptGen._llama_log_path):
+            try:
+                with open(Gemma4PromptGen._llama_log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    tail = fh.read()[-1200:].strip()
+            except Exception:
+                tail = ""
+        suffix = f"\n{tail}" if tail else ""
+        return f"❌ llama-server health check timed out after 120s.{suffix}"
 
     def _kill_llama_server(self):
         """Kill llama-server process to free VRAM after SEND."""
@@ -4143,6 +4207,12 @@ class Gemma4PromptGen:
             except Exception:
                 pass
         Gemma4PromptGen._llama_process = None
+        if Gemma4PromptGen._llama_log_path and os.path.isfile(Gemma4PromptGen._llama_log_path):
+            try:
+                os.unlink(Gemma4PromptGen._llama_log_path)
+            except Exception:
+                pass
+        Gemma4PromptGen._llama_log_path = None
         print("[Gemma4PromptGen] llama-server killed — VRAM freed.")
 
 
