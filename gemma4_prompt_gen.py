@@ -2770,8 +2770,10 @@ class Gemma4PromptGen:
         # before producing any output. For video models this is fine — deeper reasoning
         # helps with arc/audio structure. For image models (booru tags, short prompts)
         # it burns 5+ minutes producing nothing useful. /no_think disables it instantly.
-        if not is_video_model(target_model):
-            parts.append("/no_think")
+        # NOTE: /no_think is Qwen-specific — do NOT inject for Gemma 4 (thinking is
+        # controlled server-side via --reasoning-budget, and /no_think would appear
+        # as literal text in the prompt).
+        # Kept as a stub in case Qwen models are used in the future.
 
         parts.append("Read and follow these instructions carefully:\n")
         parts.append(system_prompt)
@@ -3594,6 +3596,10 @@ class Gemma4PromptGen:
         if text.startswith("❌") or text.startswith("⚠️"):
             return text, ""
 
+        # Strip thinking blocks from reasoning models before parsing
+        text = re.sub(r"(?is)<\|channel>thought.*?<channel\|>\s*", "", text)
+        text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
+
         # Strip POSITIVE: label and everything from NEGATIVE: onward.
         # Image models (SDXL, Pony, SD1.5) output both blocks — we only want
         # the positive tags in the prompt wire. Negatives belong in the
@@ -3806,8 +3812,8 @@ class Gemma4PromptGen:
                 result = json.loads(resp.read().decode("utf-8"))
             content = result["choices"][0]["message"]["content"]
             # Strip reasoning/thinking blocks — covers Gemma 4, Qwen 3, and generic <think> formats
-            content = re.sub(r'<\|channel\|>thought\n.*?<\|/channel\|>', '', content, flags=re.DOTALL)
-            content = re.sub(r'<\|channel>thought\n.*?<channel\|>',      '', content, flags=re.DOTALL)
+            # Gemma 4 DECKARD thinking format: <|channel>thought ... <channel|>
+            content = re.sub(r'<\|channel>thought\s*.*?<channel\|>', '', content, flags=re.DOTALL)
             content = re.sub(r'<think>.*?</think>',                       '', content, flags=re.DOTALL)
             content = content.strip()
             # If stripping thinking tokens left us with nothing, that means the model
@@ -3987,7 +3993,7 @@ class Gemma4PromptGen:
             "-m", model_path,
             "-ngl", "99",
             "--ctx-size", "12288",
-            "--flash-attn", "on",
+            "--flash-attn",
             "--reasoning-budget", "0",
         ]
         if mmproj_path:
