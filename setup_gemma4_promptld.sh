@@ -21,6 +21,10 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Colour
 
+first_match() {
+    find "$@" -print -quit 2>/dev/null
+}
+
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}║       Gemma4 PromptLD — Auto Setup (Lightning.ai)   ║${NC}"
@@ -97,13 +101,18 @@ else
 
     # Extract tar.gz (Linux release is a tarball, not zip)
     if [[ "${LLAMA_ARCHIVE}" == *.tar.gz ]] || [[ "${LLAMA_ARCHIVE}" == *.tgz ]]; then
-        tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" --strip-components=1 2>/dev/null || \
-        tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" 2>/dev/null
+        if ! tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" --strip-components=1 2>/dev/null; then
+            if ! tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" 2>/dev/null; then
+                echo -e "${RED}❌ Failed to extract ${LLAMA_ARCHIVE}.${NC}"
+                echo "   The downloaded archive may be incomplete or in an unexpected format."
+                exit 1
+            fi
+        fi
     elif [[ "${LLAMA_ARCHIVE}" == *.zip ]]; then
         unzip -o "${LLAMA_ARCHIVE}" -d "${LLAMA_DIR}"
         # Flatten any subfolder
         if [ "$(ls -d "${LLAMA_DIR}"/*/  2>/dev/null | wc -l)" -eq 1 ]; then
-            SUBDIR=$(ls -d "${LLAMA_DIR}"/*/ | head -1)
+            SUBDIR=$(find "${LLAMA_DIR}" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)
             mv "${SUBDIR}"* "${LLAMA_DIR}/" 2>/dev/null || true
             rmdir "${SUBDIR}" 2>/dev/null || true
         fi
@@ -113,7 +122,7 @@ else
 
     # Find llama-server in extracted files (may be nested)
     if [ ! -f "${LLAMA_EXE}" ]; then
-        FOUND_EXE=$(find "${LLAMA_DIR}" -name "llama-server" -type f 2>/dev/null | head -1)
+        FOUND_EXE=$(first_match "${LLAMA_DIR}" -type f -name "llama-server" || true)
         if [ -n "${FOUND_EXE}" ]; then
             # Move it to the expected location if it's nested
             if [ "${FOUND_EXE}" != "${LLAMA_EXE}" ]; then
@@ -136,7 +145,7 @@ else
 fi
 
 # Also make all binaries in the llama dir executable
-find "${LLAMA_DIR}" -type f -executable -o -name "llama-*" 2>/dev/null | while read f; do
+find "${LLAMA_DIR}" \( -type f -executable -o -type f -name "llama-*" \) 2>/dev/null | while read -r f; do
     chmod +x "$f" 2>/dev/null || true
 done
 
@@ -159,7 +168,7 @@ echo ""
 mkdir -p "${MODELS_DIR}"
 
 # Check if any GGUF already exists (excluding mmproj)
-GGUF_FOUND=$(find "${MODELS_DIR}" -name "*.gguf" ! -iname "*mmproj*" 2>/dev/null | head -1)
+GGUF_FOUND=$(first_match "${MODELS_DIR}" -name "*.gguf" ! -iname "*mmproj*" || true)
 
 if [ -n "${GGUF_FOUND}" ]; then
     echo -e "${GREEN}✅ GGUF model already present in ${MODELS_DIR} — skipping download.${NC}"
