@@ -25,6 +25,108 @@ first_match() {
     find "$@" -print -quit 2>/dev/null
 }
 
+download_prebuilt_llama() {
+    echo -e "${YELLOW}⚠  llama-server not found. Attempting prebuilt download to ${LLAMA_DIR}...${NC}"
+    echo ""
+    echo "URL: ${LLAMA_URL}"
+    echo ""
+
+    mkdir -p "${LLAMA_DIR}"
+
+    if ! curl -fL --progress-bar -o "${LLAMA_ARCHIVE}" "${LLAMA_URL}"; then
+        echo -e "${YELLOW}⚠ Prebuilt download failed or no longer exists at that URL.${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo "Extracting..."
+
+    if ! tar -tzf "${LLAMA_ARCHIVE}" >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠ Downloaded file is not a valid tar.gz archive.${NC}"
+        rm -f "${LLAMA_ARCHIVE}"
+        return 1
+    fi
+
+    if ! tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" --strip-components=1 2>/dev/null; then
+        if ! tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" 2>/dev/null; then
+            echo -e "${YELLOW}⚠ Failed to extract the prebuilt archive.${NC}"
+            rm -f "${LLAMA_ARCHIVE}"
+            return 1
+        fi
+    fi
+
+    rm -f "${LLAMA_ARCHIVE}"
+
+    if [ ! -f "${LLAMA_EXE}" ]; then
+        FOUND_EXE=$(first_match "${LLAMA_DIR}" -type f -name "llama-server" || true)
+        if [ -n "${FOUND_EXE}" ] && [ "${FOUND_EXE}" != "${LLAMA_EXE}" ]; then
+            mv "${FOUND_EXE}" "${LLAMA_EXE}"
+        fi
+    fi
+
+    if [ -f "${LLAMA_EXE}" ]; then
+        chmod +x "${LLAMA_EXE}"
+        echo -e "${GREEN}✅ llama-server installed from prebuilt archive at ${LLAMA_EXE}${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}⚠ Prebuilt archive extracted, but llama-server was not found inside it.${NC}"
+    return 1
+}
+
+build_llama_from_source() {
+    echo ""
+    echo -e "${CYAN}Falling back to building llama.cpp from source with CUDA support...${NC}"
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo -e "${RED}❌ git is required to build llama.cpp from source.${NC}"
+        exit 1
+    fi
+
+    if ! command -v cmake >/dev/null 2>&1; then
+        echo -e "${RED}❌ cmake is required to build llama.cpp from source.${NC}"
+        exit 1
+    fi
+
+    mkdir -p "${STUDIO_BASE}"
+
+    if [ -d "${LLAMA_SRC_DIR}/.git" ]; then
+        echo "Updating existing llama.cpp checkout..."
+        git -C "${LLAMA_SRC_DIR}" fetch --depth 1 origin master
+        git -C "${LLAMA_SRC_DIR}" reset --hard FETCH_HEAD
+    else
+        echo "Cloning llama.cpp source..."
+        rm -rf "${LLAMA_SRC_DIR}"
+        git clone --depth 1 "${LLAMA_REPO_URL}" "${LLAMA_SRC_DIR}"
+    fi
+
+    CUDA_FLAG="OFF"
+    if command -v nvcc >/dev/null 2>&1; then
+        CUDA_FLAG="ON"
+        echo -e "${GREEN}✅ nvcc detected — building with CUDA support.${NC}"
+    else
+        echo -e "${YELLOW}⚠ nvcc not found. Building CPU-only llama-server instead.${NC}"
+    fi
+
+    cmake -S "${LLAMA_SRC_DIR}" -B "${LLAMA_BUILD_DIR}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA="${CUDA_FLAG}" \
+        -DLLAMA_CURL=ON
+
+    cmake --build "${LLAMA_BUILD_DIR}" --config Release --target llama-server -j"$(nproc)"
+
+    if [ ! -f "${LLAMA_BUILD_DIR}/bin/llama-server" ]; then
+        echo -e "${RED}❌ Source build finished, but build/bin/llama-server was not created.${NC}"
+        exit 1
+    fi
+
+    mkdir -p "${LLAMA_DIR}"
+    cp -a "${LLAMA_BUILD_DIR}/bin/." "${LLAMA_DIR}/"
+    chmod +x "${LLAMA_DIR}/llama-server" 2>/dev/null || true
+
+    echo -e "${GREEN}✅ llama-server built from source and copied to ${LLAMA_DIR}${NC}"
+}
+
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}║       Gemma4 PromptLD — Auto Setup (Lightning.ai)   ║${NC}"
@@ -39,10 +141,13 @@ STUDIO_BASE="/teamspace/studios/this_studio"
 LLAMA_DIR="${STUDIO_BASE}/llama"
 MODELS_DIR="${STUDIO_BASE}/ComfyUI/models/LLM"
 LLAMA_EXE="${LLAMA_DIR}/llama-server"
+LLAMA_SRC_DIR="${STUDIO_BASE}/llama.cpp-src"
+LLAMA_BUILD_DIR="${LLAMA_SRC_DIR}/build"
 
-# llama.cpp Linux CUDA release — update version as needed
+# Historical pinned binary URL. If it disappears, fall back to source build.
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/releases/download/b8664/llama-b8664-bin-ubuntu-x64-cuda-cu12.4.tar.gz"
 LLAMA_ARCHIVE="${LLAMA_DIR}/llama_install.tar.gz"
+LLAMA_REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 
 CONFIG_FILE="$(dirname "$0")/model_config.json"
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -79,68 +184,8 @@ if command -v llama-server &>/dev/null; then
 elif [ -f "${LLAMA_EXE}" ]; then
     echo -e "${GREEN}✅ llama-server found at ${LLAMA_EXE} — skipping install.${NC}"
 else
-    echo -e "${YELLOW}⚠  llama-server not found. Downloading to ${LLAMA_DIR}...${NC}"
-    echo ""
-    echo "URL: ${LLAMA_URL}"
-    echo ""
-
-    mkdir -p "${LLAMA_DIR}"
-
-    # Download
-    if ! curl -L --progress-bar -o "${LLAMA_ARCHIVE}" "${LLAMA_URL}"; then
-        echo ""
-        echo -e "${RED}❌ Download failed. Check your internet connection.${NC}"
-        echo "   You can manually download from:"
-        echo "   ${LLAMA_URL}"
-        echo "   and extract to ${LLAMA_DIR}"
-        exit 1
-    fi
-
-    echo ""
-    echo "Extracting..."
-
-    # Extract tar.gz (Linux release is a tarball, not zip)
-    if [[ "${LLAMA_ARCHIVE}" == *.tar.gz ]] || [[ "${LLAMA_ARCHIVE}" == *.tgz ]]; then
-        if ! tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" --strip-components=1 2>/dev/null; then
-            if ! tar -xzf "${LLAMA_ARCHIVE}" -C "${LLAMA_DIR}" 2>/dev/null; then
-                echo -e "${RED}❌ Failed to extract ${LLAMA_ARCHIVE}.${NC}"
-                echo "   The downloaded archive may be incomplete or in an unexpected format."
-                exit 1
-            fi
-        fi
-    elif [[ "${LLAMA_ARCHIVE}" == *.zip ]]; then
-        unzip -o "${LLAMA_ARCHIVE}" -d "${LLAMA_DIR}"
-        # Flatten any subfolder
-        if [ "$(ls -d "${LLAMA_DIR}"/*/  2>/dev/null | wc -l)" -eq 1 ]; then
-            SUBDIR=$(find "${LLAMA_DIR}" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)
-            mv "${SUBDIR}"* "${LLAMA_DIR}/" 2>/dev/null || true
-            rmdir "${SUBDIR}" 2>/dev/null || true
-        fi
-    fi
-
-    rm -f "${LLAMA_ARCHIVE}"
-
-    # Find llama-server in extracted files (may be nested)
-    if [ ! -f "${LLAMA_EXE}" ]; then
-        FOUND_EXE=$(first_match "${LLAMA_DIR}" -type f -name "llama-server" || true)
-        if [ -n "${FOUND_EXE}" ]; then
-            # Move it to the expected location if it's nested
-            if [ "${FOUND_EXE}" != "${LLAMA_EXE}" ]; then
-                mv "${FOUND_EXE}" "${LLAMA_EXE}"
-            fi
-        fi
-    fi
-
-    # Make executable
-    if [ -f "${LLAMA_EXE}" ]; then
-        chmod +x "${LLAMA_EXE}"
-        echo -e "${GREEN}✅ llama-server installed at ${LLAMA_EXE}${NC}"
-    else
-        echo -e "${RED}❌ llama-server not found after extraction.${NC}"
-        echo "   Check ${LLAMA_DIR} manually."
-        echo "   Available files:"
-        ls -la "${LLAMA_DIR}/"
-        exit 1
+    if ! download_prebuilt_llama; then
+        build_llama_from_source
     fi
 fi
 
