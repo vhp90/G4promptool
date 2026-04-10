@@ -1,0 +1,6 @@
+{
+  "hf_repo": "nohurry/gemma-4-26B-A4B-it-heretic-GUFF",
+  "gguf_filename": "gemma-4-26b-a4b-it-heretic.q4_k_m.gguf",
+  "mmproj_filename": "gemma-4-26B-A4B-it-heretic-mmproj-bf16.gguf",
+  "build_max_workers": true
+}
