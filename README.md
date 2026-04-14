@@ -18,7 +18,7 @@
    ```
 5. Wait for the setup to finish downloading (auto-detects and uses high-speed `hf transfer` if supported).
 6. Restart ComfyUI.
-7. Add the **Gemma4 Prompt Engineer** node in ComfyUI, configure your inputs, and run your workflow!
+7. Add the **llama.cpp Prompt Engineer** node in ComfyUI, configure your inputs, and run your workflow!
 
 ### Configuration
-You can edit the `model_config.json` file to change the model repository or filenames that will be downloaded via the setup script and run by the node.
+The defaults target [GitMylo/nsfwvision-v5_qwen3.5-9b-gguf](https://huggingface.co/GitMylo/nsfwvision-v5_qwen3.5-9b-gguf), but you can edit `model_config.json` to point the setup script at any llama.cpp-compatible GGUF and matching `mmproj` file.

@@ -1,7 +1,7 @@
 """
-Gemma4PromptGen - ComfyUI Node (v1.0)
+LlamaCppPromptGen - ComfyUI Node (v1.0)
 =======================================
-Multi-model prompt engineer powered by local Gemma 4 via llama-server.
+Multi-model prompt engineer powered by local llama.cpp models via llama-server.
 
   IMAGE MODELS (single image output):
     • Flux.1  — natural language, subject-first, cinematographic
@@ -17,7 +17,7 @@ Modes:
   PREVIEW  — Flushes VRAM, calls llama-server, stores prompt, halts pipeline.
   SEND     — Outputs stored prompt, kills llama-server process, frees VRAM.
 
-Backend: llama-server (llama.cpp) running Gemma 4 31B abliterated GGUF locally.
+Backend: llama-server (llama.cpp) running a local GGUF model.
 llama-server must be running before PREVIEW is triggered.
 
 All models support: NSFW content, image grounding (I2V/I2I), character lock,
@@ -37,6 +37,9 @@ import time
 import urllib.request
 import urllib.error
 
+DEFAULT_HF_REPO = "GitMylo/nsfwvision-v5_qwen3.5-9b-gguf"
+DEFAULT_GGUF_FILENAME = "nsfwvision_v5-Q4_K_M.gguf"
+DEFAULT_MMPROJ_FILENAME = "mmproj-nsfwvision_v5.gguf"
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ENVIRONMENT PRESETS
@@ -2156,6 +2159,86 @@ else:
     _NO_GGUF_MSG = f"No GGUFs found — add .gguf files to {MODELS_DIR} and restart ComfyUI"
 
 
+def _node_model_config() -> dict:
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_config.json")
+    defaults = {
+        "hf_repo": DEFAULT_HF_REPO,
+        "gguf_filename": DEFAULT_GGUF_FILENAME,
+        "mmproj_filename": DEFAULT_MMPROJ_FILENAME,
+    }
+    try:
+        with open(config_path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            defaults.update({k: v for k, v in loaded.items() if v})
+    except Exception:
+        pass
+    return defaults
+
+
+_MODEL_CONFIG = _node_model_config()
+_PREFERRED_GGUF = _MODEL_CONFIG.get("gguf_filename", DEFAULT_GGUF_FILENAME)
+_PREFERRED_MMPROJ = _MODEL_CONFIG.get("mmproj_filename", DEFAULT_MMPROJ_FILENAME)
+
+
+def _model_basename(name_or_path: str) -> str:
+    name = os.path.basename(name_or_path or "")
+    if name.lower().endswith(".gguf"):
+        name = name[:-5]
+    return name
+
+
+def _model_stem(name_or_path: str) -> str:
+    base = _model_basename(name_or_path).lower()
+    base = re.sub(r"-(q\d(_k_[msl])?|q\d_0|fp16|bf16|f16|iq\d.*)$", "", base)
+    return base.replace("mmproj-", "")
+
+
+def _infer_model_traits(name_or_path: str) -> dict:
+    lower = _model_basename(name_or_path).lower()
+    is_qwen = "qwen" in lower
+    thinking_hint = any(token in lower for token in ["thinking", "reason", "r1", "think"])
+    return {
+        "is_qwen": is_qwen,
+        "is_thinking_model": is_qwen or thinking_hint,
+        "supports_no_think": is_qwen,
+    }
+
+
+def _find_matching_mmproj(model_path: str) -> str | None:
+    models_dir = os.path.dirname(model_path)
+    if not os.path.isdir(models_dir):
+        return None
+
+    preferred_path = os.path.join(models_dir, _PREFERRED_MMPROJ)
+    if os.path.isfile(preferred_path):
+        return preferred_path
+
+    mmproj_files = sorted(
+        f for f in os.listdir(models_dir)
+        if f.lower().endswith(".gguf") and "mmproj" in f.lower()
+    )
+    if not mmproj_files:
+        return None
+
+    stem = _model_stem(model_path)
+    for filename in mmproj_files:
+        if stem and stem in _model_stem(filename):
+            return os.path.join(models_dir, filename)
+
+    return os.path.join(models_dir, mmproj_files[0])
+
+
+def _llama_log_tail(path: str | None, max_chars: int = 1200) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()[-max_chars:].strip()
+    except Exception:
+        return ""
+
+
 def _scan_models_folder() -> list:
     """Return list of .gguf filenames in the models directory, or a placeholder."""
     if not os.path.isdir(MODELS_DIR):
@@ -2165,6 +2248,8 @@ def _scan_models_folder() -> list:
             pass
     try:
         ggufs = sorted([f for f in os.listdir(MODELS_DIR) if f.lower().endswith(".gguf") and "mmproj" not in f.lower()])
+        if _PREFERRED_GGUF in ggufs:
+            ggufs = [_PREFERRED_GGUF] + [f for f in ggufs if f != _PREFERRED_GGUF]
         return ggufs if ggufs else [_NO_GGUF_MSG]
     except Exception:
         return [_NO_GGUF_MSG]
@@ -2174,9 +2259,9 @@ def _scan_models_folder() -> list:
 #  NODE CLASS
 # ══════════════════════════════════════════════════════════════════════════
 
-class Gemma4PromptGen:
+class LlamaCppPromptGen:
     """
-    Multi-model prompt engineer with Gemma 4 llama-server backend.
+    Multi-model prompt engineer with a llama.cpp llama-server backend.
 
     Supports: LTX 2.3, Wan 2.2, Flux.1, SDXL 1.0, Pony XL, SD 1.5.
     All models support NSFW content, image grounding, character lock, environments.
@@ -2190,6 +2275,11 @@ class Gemma4PromptGen:
     _last_qc      = ""
     _llama_process = None
     _llama_log_path = None
+    _llama_log_handle = None
+    _server_model_id = _PREFERRED_GGUF
+    _selected_model_name = _PREFERRED_GGUF
+    _model_traits = _infer_model_traits(_PREFERRED_GGUF)
+    _vision_enabled = False
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2453,7 +2543,7 @@ class Gemma4PromptGen:
     RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING",)
     RETURN_NAMES = ("preview_prompt", "send_prompt", "neg_prompt", "qc_report",)
     FUNCTION = "execute"
-    CATEGORY = "LoRa-Daddy/Gemma4"
+    CATEGORY = "LoRa-Daddy/llama.cpp"
     OUTPUT_NODE = True
 
     def execute(self, **kwargs):
@@ -2552,6 +2642,10 @@ class Gemma4PromptGen:
                 return (f"❌ No GGUF files found in {MODELS_DIR}. Add a GGUF and restart ComfyUI.", "", "", "",)
             model_path = os.path.join(models_dir, found[0])
 
+        self._selected_model_name = os.path.basename(model_path)
+        self._model_traits = _infer_model_traits(self._selected_model_name)
+        self._server_model_id = _model_basename(model_path)
+
         # ── PREVIEW MODE ────────────────────────────────────────────────
         if mode == "PREVIEW":
             # Flush ComfyUI models from VRAM first (if auto_unload)
@@ -2592,7 +2686,7 @@ class Gemma4PromptGen:
             image_paths  = []   # list of temp file paths sent to LLM
             image_mode   = "none"  # "single" | "bracket" | "video"
 
-            if use_image:
+            if use_image and getattr(self, "_vision_enabled", False):
                 # ── Priority 1: video_frames batch ───────────────────────────
                 if video_frames is not None and video_frames.ndim == 4 and video_frames.shape[0] > 1:
                     total_frames = video_frames.shape[0]
@@ -2651,6 +2745,9 @@ class Gemma4PromptGen:
                         image_mode = "single"
                     except Exception as e:
                         print(f"[Gemma4PromptGen] video_frames(1) encode failed: {e}")
+
+            if use_image and not getattr(self, "_vision_enabled", False):
+                print("[Gemma4PromptGen] Image inputs were provided, but the selected GGUF has no matching mmproj loaded. Continuing in text-only mode.")
 
             print(f"[Gemma4PromptGen] Image mode: {image_mode}, paths: {len(image_paths)}")
 
@@ -2856,14 +2953,9 @@ class Gemma4PromptGen:
         # Pre-compute instr_lower here — used by content gate block AND energy block below
         instr_lower = instruction.lower() if instruction else ""
 
-        # Qwen 3 ships with a chain-of-thought "thinking" mode that runs silently
-        # before producing any output. For video models this is fine — deeper reasoning
-        # helps with arc/audio structure. For image models (booru tags, short prompts)
-        # it burns 5+ minutes producing nothing useful. /no_think disables it instantly.
-        # NOTE: /no_think is Qwen-specific — do NOT inject for Gemma 4 (thinking is
-        # controlled server-side via --reasoning-budget, and /no_think would appear
-        # as literal text in the prompt).
-        # Kept as a stub in case Qwen models are used in the future.
+        model_traits = getattr(self, "_model_traits", {})
+        if model_traits.get("supports_no_think"):
+            parts.append("/no_think\n")
 
         parts.append("Read and follow these instructions carefully:\n")
         parts.append(system_prompt)
@@ -3838,6 +3930,22 @@ class Gemma4PromptGen:
 
         return text, neg_prompt
 
+    def _resolve_server_model_id(self, server_url: str) -> str:
+        fallback = getattr(self, "_server_model_id", _model_basename(getattr(self, "_selected_model_name", "")) or "llama")
+        try:
+            req = urllib.request.Request(f"{server_url}/v1/models", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            data = payload.get("data") or []
+            if data and isinstance(data, list):
+                model_id = data[0].get("id")
+                if model_id:
+                    self._server_model_id = model_id
+                    return model_id
+        except Exception:
+            pass
+        return fallback
+
     # ── llama-server call ─────────────────────────────────────────────────
 
     def _call_llama(self, combined_message: str, system_prompt: str,
@@ -3889,6 +3997,8 @@ class Gemma4PromptGen:
         else:
             user_content = combined_message
 
+        model_id = self._resolve_server_model_id(server_url)
+
         # Scale max_tokens — word_target wins if set, otherwise scale with duration
         if word_target > 0:
             # words * 1.5 = safe token headroom (English avg ~0.75 tokens/word)
@@ -3907,7 +4017,7 @@ class Gemma4PromptGen:
                 max_tok = 700
 
         payload = {
-            "model": "gemma4",
+            "model": model_id,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_content},
@@ -4095,84 +4205,107 @@ class Gemma4PromptGen:
         if not os.path.isfile(model_path):
             return f"❌ Model GGUF not found at: {model_path}"
 
-        # Auto-detect mmproj in models directory — only if use_image is enabled
+        self._server_model_id = _model_basename(model_path)
+
+        # Auto-detect a matching mmproj in models directory — only if use_image is enabled
         mmproj_path = None
-        models_dir = os.path.dirname(model_path)
         if getattr(self, '_use_image', False):
-            for f in os.listdir(models_dir):
-                if "mmproj" in f.lower() and f.lower().endswith(".gguf"):
-                    mmproj_path = os.path.join(models_dir, f)
-                    print(f"[Gemma4PromptGen] mmproj found: {mmproj_path} — vision enabled")
-                    break
+            mmproj_path = _find_matching_mmproj(model_path)
+            if mmproj_path:
+                print(f"[Gemma4PromptGen] mmproj found: {mmproj_path} — vision enabled")
+            else:
+                print("[Gemma4PromptGen] no matching mmproj found — falling back to text-only mode")
         else:
             print("[Gemma4PromptGen] use_image is OFF — skipping mmproj, text-only mode")
+        self._vision_enabled = bool(mmproj_path)
 
-        cmd = [
+        cmd_base = [
             llama_exe,
             "-m", model_path,
             "-ngl", "99",
             "--ctx-size", "32768",
-            "--flash-attn", "on",
-            "--reasoning-budget", "0",
         ]
         if mmproj_path:
-            cmd += ["--mmproj", mmproj_path]
+            cmd_base += ["--mmproj", mmproj_path]
 
-        try:
-            log_file = tempfile.NamedTemporaryFile(prefix="gemma4_llama_", suffix=".log", delete=False)
-            log_file.close()
-            Gemma4PromptGen._llama_log_path = log_file.name
-            popen_kwargs = {
-                "stdout": open(log_file.name, "ab"),
-                "stderr": subprocess.STDOUT,
-            }
-            if _IS_WINDOWS:
-                CREATE_NEW_PROCESS_GROUP = 0x00000200
-                DETACHED_PROCESS = 0x00000008
-                popen_kwargs["creationflags"] = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
-            else:
-                # Linux/Lightning.ai: start in new process group, ignore HUP
-                popen_kwargs["start_new_session"] = True
-                # Set LD_LIBRARY_PATH for CUDA libs on Lightning.ai
-                env = os.environ.copy()
-                cuda_paths = ["/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu"]
-                existing = env.get("LD_LIBRARY_PATH", "")
-                env["LD_LIBRARY_PATH"] = ":".join(cuda_paths + ([existing] if existing else []))
-                popen_kwargs["env"] = env
+        arg_attempts = [
+            ["--flash-attn", "on", "--reasoning-budget", "0"],
+            ["--flash-attn", "on"],
+            [],
+        ]
 
-            Gemma4PromptGen._llama_process = subprocess.Popen(cmd, **popen_kwargs)
-        except Exception as e:
-            return f"❌ Failed to start llama-server: {e}"
+        popen_kwargs = {}
+        if _IS_WINDOWS:
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            DETACHED_PROCESS = 0x00000008
+            popen_kwargs["creationflags"] = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        else:
+            popen_kwargs["start_new_session"] = True
+            env = os.environ.copy()
+            cuda_paths = ["/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu"]
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = ":".join(cuda_paths + ([existing] if existing else []))
+            popen_kwargs["env"] = env
 
-        print(f"[Gemma4PromptGen] llama-server starting {'with vision' if mmproj_path else 'text-only'}, waiting for health check...")
-        max_wait = 120
-        waited = 0
-        while waited < max_wait:
-            proc = Gemma4PromptGen._llama_process
-            if proc is not None and proc.poll() is not None:
-                tail = ""
-                if Gemma4PromptGen._llama_log_path and os.path.isfile(Gemma4PromptGen._llama_log_path):
-                    try:
-                        with open(Gemma4PromptGen._llama_log_path, "r", encoding="utf-8", errors="replace") as fh:
-                            tail = fh.read()[-1200:].strip()
-                    except Exception:
-                        tail = ""
-                suffix = f"\n{tail}" if tail else ""
-                return f"❌ llama-server exited before becoming healthy (code {proc.returncode}).{suffix}"
-            if self._check_health(server_url):
-                return f"✅ llama-server started ({waited}s){' — vision enabled' if mmproj_path else ''}"
-            time.sleep(2)
-            waited += 2
-
-        tail = ""
-        if Gemma4PromptGen._llama_log_path and os.path.isfile(Gemma4PromptGen._llama_log_path):
+        last_tail = ""
+        for extra_args in arg_attempts:
+            cmd = cmd_base + extra_args
             try:
-                with open(Gemma4PromptGen._llama_log_path, "r", encoding="utf-8", errors="replace") as fh:
-                    tail = fh.read()[-1200:].strip()
-            except Exception:
-                tail = ""
-        suffix = f"\n{tail}" if tail else ""
-        return f"❌ llama-server health check timed out after 120s.{suffix}"
+                log_file = tempfile.NamedTemporaryFile(prefix="gemma4_llama_", suffix=".log", delete=False)
+                log_file.close()
+                Gemma4PromptGen._llama_log_path = log_file.name
+                if Gemma4PromptGen._llama_log_handle is not None:
+                    try:
+                        Gemma4PromptGen._llama_log_handle.close()
+                    except Exception:
+                        pass
+                proc_log = open(log_file.name, "ab")
+                Gemma4PromptGen._llama_log_handle = proc_log
+                Gemma4PromptGen._llama_process = subprocess.Popen(
+                    cmd,
+                    stdout=proc_log,
+                    stderr=subprocess.STDOUT,
+                    **popen_kwargs,
+                )
+            except Exception as e:
+                return f"❌ Failed to start llama-server: {e}"
+
+            print(f"[Gemma4PromptGen] llama-server starting {'with vision' if mmproj_path else 'text-only'}, waiting for health check...")
+            max_wait = 120
+            waited = 0
+            while waited < max_wait:
+                proc = Gemma4PromptGen._llama_process
+                if proc is not None and proc.poll() is not None:
+                    last_tail = _llama_log_tail(Gemma4PromptGen._llama_log_path)
+                    unsupported_arg = (
+                        "unknown argument" in last_tail.lower()
+                        or "unknown value for --flash-attn" in last_tail.lower()
+                        or "invalid argument" in last_tail.lower()
+                    )
+                    if unsupported_arg and extra_args != arg_attempts[-1]:
+                        break
+                    suffix = f"\n{last_tail}" if last_tail else ""
+                    return f"❌ llama-server exited before becoming healthy (code {proc.returncode}).{suffix}"
+                if self._check_health(server_url):
+                    self._server_model_id = self._resolve_server_model_id(server_url)
+                    return f"✅ llama-server started ({waited}s){' — vision enabled' if mmproj_path else ''}"
+                time.sleep(2)
+                waited += 2
+
+            if self._check_health(server_url):
+                self._server_model_id = self._resolve_server_model_id(server_url)
+                return f"✅ llama-server started ({waited}s){' — vision enabled' if mmproj_path else ''}"
+
+            last_tail = _llama_log_tail(Gemma4PromptGen._llama_log_path)
+            if extra_args == arg_attempts[-1]:
+                suffix = f"\n{last_tail}" if last_tail else ""
+                return f"❌ llama-server health check timed out after 120s.{suffix}"
+
+            self._kill_llama_server()
+            print("[Gemma4PromptGen] Retrying llama-server with a more compatible flag set...")
+
+        suffix = f"\n{last_tail}" if last_tail else ""
+        return f"❌ llama-server could not be started.{suffix}"
 
     def _kill_llama_server(self):
         """Kill llama-server process to free VRAM after SEND."""
@@ -4207,6 +4340,12 @@ class Gemma4PromptGen:
             except Exception:
                 pass
         Gemma4PromptGen._llama_process = None
+        if Gemma4PromptGen._llama_log_handle is not None:
+            try:
+                Gemma4PromptGen._llama_log_handle.close()
+            except Exception:
+                pass
+        Gemma4PromptGen._llama_log_handle = None
         if Gemma4PromptGen._llama_log_path and os.path.isfile(Gemma4PromptGen._llama_log_path):
             try:
                 os.unlink(Gemma4PromptGen._llama_log_path)
@@ -4217,10 +4356,14 @@ class Gemma4PromptGen:
 
 
 # ── ComfyUI Registration ──────────────────────────────────────────────────
+Gemma4PromptGen = LlamaCppPromptGen
+
 NODE_CLASS_MAPPINGS = {
+    "LlamaCppPromptGen": LlamaCppPromptGen,
     "Gemma4PromptGen": Gemma4PromptGen,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Gemma4PromptGen": "🤖 Gemma4 Prompt Engineer",
+    "LlamaCppPromptGen": "🤖 llama.cpp Prompt Engineer",
+    "Gemma4PromptGen": "🤖 llama.cpp Prompt Engineer",
 }

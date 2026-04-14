@@ -174,6 +174,42 @@ MMPROJ_URL="https://huggingface.co/${HF_REPO}/resolve/main/${MMPROJ_FILE_NAME}"
 MMPROJ_FILE="${MODELS_DIR}/${MMPROJ_FILE_NAME}"
 # ────────────────────────────────────────────────────────────────────────────
 
+download_hf_asset() {
+    local repo="$1"
+    local filename="$2"
+    local target_dir="$3"
+    local target_file="$4"
+    local url="$5"
+    local label="$6"
+    local token_arg="$7"
+
+    if [ -f "${target_file}" ]; then
+        echo -e "${GREEN}✅ ${label} already present: $(basename "${target_file}")${NC}"
+        return 0
+    fi
+
+    if command -v hf >/dev/null 2>&1; then
+        if hf download "${repo}" "${filename}" --local-dir "${target_dir}" ${token_arg}; then
+            echo -e "${GREEN}✅ ${label} downloaded via High-Speed HF CLI.${NC}"
+            return 0
+        fi
+        echo -e "${YELLOW}⚠ HF CLI failed for ${label}. Falling back to curl...${NC}"
+    fi
+
+    if [ -n "${HF_TOKEN:-}" ]; then
+        if ! curl -H "Authorization: Bearer ${HF_TOKEN}" -L --progress-bar -o "${target_file}" "${url}"; then
+            return 1
+        fi
+    else
+        if ! curl -L --progress-bar -o "${target_file}" "${url}"; then
+            return 1
+        fi
+    fi
+
+    echo -e "${GREEN}✅ ${label} downloaded via fallback.${NC}"
+    return 0
+}
+
 # ── STEP 1/4: Install llama-server ──────────────────────────────────────────
 echo -e "${BOLD}[STEP 1/4] Checking llama-server...${NC}"
 echo ""
@@ -212,14 +248,19 @@ echo ""
 
 mkdir -p "${MODELS_DIR}"
 
-# Check if any GGUF already exists (excluding mmproj)
+# Check for the configured GGUF specifically, but still report existing models.
 GGUF_FOUND=$(first_match "${MODELS_DIR}" -name "*.gguf" ! -iname "*mmproj*" || true)
 
-if [ -n "${GGUF_FOUND}" ]; then
-    echo -e "${GREEN}✅ GGUF model already present in ${MODELS_DIR} — skipping download.${NC}"
-    echo "   Found: $(basename "${GGUF_FOUND}")"
+if [ -f "${GGUF_FILE}" ]; then
+    echo -e "${GREEN}✅ Configured GGUF already present in ${MODELS_DIR} — skipping download.${NC}"
+    echo "   Found: $(basename "${GGUF_FILE}")"
 else
-    echo -e "${YELLOW}⚠  No GGUF found in ${MODELS_DIR}.${NC}"
+    if [ -n "${GGUF_FOUND}" ]; then
+        echo -e "${YELLOW}⚠  A different GGUF already exists in ${MODELS_DIR}, but the configured default is missing.${NC}"
+        echo "   Existing: $(basename "${GGUF_FOUND}")"
+    else
+        echo -e "${YELLOW}⚠  No GGUF found in ${MODELS_DIR}.${NC}"
+    fi
     echo ""
     echo "Configured model: ${HF_REPO} -> ${GGUF_FILE_NAME}"
     echo ""
@@ -244,48 +285,33 @@ else
             HF_TOKEN_ARG="--token ${HF_TOKEN}"
         fi
 
-        if hf download "${HF_REPO}" "${GGUF_FILE_NAME}" --local-dir "${MODELS_DIR}" $HF_TOKEN_ARG; then
-            echo -e "${GREEN}✅ Model downloaded via High-Speed HF CLI.${NC}"
-        else
-            echo -e "${YELLOW}⚠ HF CLI failed. Falling back to curl...${NC}"
-            if [ -n "${HF_TOKEN:-}" ]; then
-                if ! curl -H "Authorization: Bearer ${HF_TOKEN}" -L --progress-bar -o "${GGUF_FILE}" "${GGUF_URL}"; then
-                    echo -e "${RED}❌ GGUF download failed. Download manually and place in ${MODELS_DIR}${NC}"
-                    exit 1
-                fi
-            else
-                if ! curl -L --progress-bar -o "${GGUF_FILE}" "${GGUF_URL}"; then
-                    echo -e "${RED}❌ GGUF download failed. Download manually and place in ${MODELS_DIR}${NC}"
-                    exit 1
-                fi
-            fi
-            echo -e "${GREEN}✅ Model downloaded via fallback.${NC}"
+        if ! download_hf_asset "${HF_REPO}" "${GGUF_FILE_NAME}" "${MODELS_DIR}" "${GGUF_FILE}" "${GGUF_URL}" "Model GGUF" "${HF_TOKEN_ARG}"; then
+            echo -e "${RED}❌ GGUF download failed. Download manually and place in ${MODELS_DIR}${NC}"
+            exit 1
         fi
 
         echo ""
         echo "Downloading mmproj (enables image input)..."
-        if hf download "${HF_REPO}" "${MMPROJ_FILE_NAME}" --local-dir "${MODELS_DIR}" $HF_TOKEN_ARG; then
-            echo -e "${GREEN}✅ mmproj downloaded — vision enabled.${NC}"
-        else
-            echo -e "${YELLOW}⚠ HF CLI failed. Falling back to curl...${NC}"
-            if [ -n "${HF_TOKEN:-}" ]; then
-                if ! curl -H "Authorization: Bearer ${HF_TOKEN}" -L --progress-bar -o "${MMPROJ_FILE}" "${MMPROJ_URL}"; then
-                    echo -e "${YELLOW}❌ mmproj download failed. You can grab it manually from HuggingFace.${NC}"
-                else
-                    echo -e "${GREEN}✅ mmproj downloaded — vision enabled.${NC}"
-                fi
-            else
-                if ! curl -L --progress-bar -o "${MMPROJ_FILE}" "${MMPROJ_URL}"; then
-                    echo -e "${YELLOW}❌ mmproj download failed. You can grab it manually from HuggingFace.${NC}"
-                else
-                    echo -e "${GREEN}✅ mmproj downloaded — vision enabled.${NC}"
-                fi
-            fi
+        if ! download_hf_asset "${HF_REPO}" "${MMPROJ_FILE_NAME}" "${MODELS_DIR}" "${MMPROJ_FILE}" "${MMPROJ_URL}" "mmproj" "${HF_TOKEN_ARG}"; then
+            echo -e "${YELLOW}❌ mmproj download failed. You can grab it manually from HuggingFace.${NC}"
         fi
     else
         echo ""
         echo "Skipped. Place your GGUF in: ${MODELS_DIR}"
         echo "Then restart ComfyUI — it will appear in the node dropdown."
+    fi
+fi
+
+if [ -f "${GGUF_FILE}" ] && [ ! -f "${MMPROJ_FILE}" ] && [ -n "${MMPROJ_FILE_NAME}" ]; then
+    echo ""
+    echo -e "${YELLOW}⚠ Configured vision adapter is missing: ${MMPROJ_FILE_NAME}${NC}"
+    echo "Downloading mmproj for the configured default model..."
+    HF_TOKEN_ARG=""
+    if [ -n "${HF_TOKEN:-}" ]; then
+        HF_TOKEN_ARG="--token ${HF_TOKEN}"
+    fi
+    if ! download_hf_asset "${HF_REPO}" "${MMPROJ_FILE_NAME}" "${MODELS_DIR}" "${MMPROJ_FILE}" "${MMPROJ_URL}" "mmproj" "${HF_TOKEN_ARG}"; then
+        echo -e "${YELLOW}❌ mmproj download failed. You can grab it manually from HuggingFace.${NC}"
     fi
 fi
 

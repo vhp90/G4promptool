@@ -1,6 +1,6 @@
 {
-  "hf_repo": "mradermacher/gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking-GGUF",
-  "gguf_filename": "gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking.Q6_K.gguf",
-  "mmproj_filename": "gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking.mmproj-f16.gguf",
+  "hf_repo": "GitMylo/nsfwvision-v5_qwen3.5-9b-gguf",
+  "gguf_filename": "nsfwvision_v5-Q4_K_M.gguf",
+  "mmproj_filename": "mmproj-nsfwvision_v5.gguf",
   "build_max_workers": true
 }
