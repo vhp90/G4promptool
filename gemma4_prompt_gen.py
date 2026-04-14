@@ -40,6 +40,25 @@ import urllib.error
 DEFAULT_HF_REPO = "GitMylo/nsfwvision-v5_qwen3.5-9b-gguf"
 DEFAULT_GGUF_FILENAME = "nsfwvision_v5-Q4_K_M.gguf"
 DEFAULT_MMPROJ_FILENAME = "mmproj-nsfwvision_v5.gguf"
+PROMPT_STYLE_PRESETS = ["Plain", "LTX Vision/Audio", "Custom"]
+
+LTX_VISION_AUDIO_SYSTEM_PROMPT = """You generate prompts for LTX video in one strict format only.
+
+Output exactly these two sections and nothing else:
+
+vision:
+<the full visual prompt>
+
+audio:
+<the full audio prompt>
+
+Rules:
+- Keep the section labels exactly as 'vision:' and 'audio:'
+- Do not add any preamble, explanation, markdown, or extra sections
+- Put all visual direction, action, camera, scene, and subject details inside the vision section
+- Put all sound, ambience, dialogue, voice, music, and sonic details inside the audio section
+- Never merge the two sections together
+"""
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ENVIRONMENT PRESETS
@@ -2522,6 +2541,31 @@ class LlamaCppPromptGen:
                         "tooltip": "auto_unload safely kills the server (OS keeps it in System RAM anyway!). keep_loaded permanently locks 15GB of VRAM.",
                     },
                 ),
+                "🧩 prompt_style_preset": (
+                    PROMPT_STYLE_PRESETS,
+                    {
+                    "default": "Plain",
+                    "tooltip": (
+                        "Choose how strictly the model should format its final prompt output. "
+                        "Plain uses the built-in target-model system prompt. "
+                        "LTX Vision/Audio forces a two-section output with 'vision:' and 'audio:'. "
+                        "Custom uses the connected custom prompt-format text input."
+                    ),
+                    },
+                ),
+                "🧾 custom_prompt_format": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "placeholder": "Example:\nvision:\naudio:\n",
+                        "forceInput": True,
+                        "tooltip": (
+                            "Connect a text node here when using the Custom preset. "
+                            "That text becomes the exact system prompt format the model must follow."
+                        ),
+                    },
+                ),
                 # ── BACKEND CONFIG ─────────────────────────────────────────
                 "🖥️ llama_server_url": (
                     "STRING",
@@ -2605,6 +2649,9 @@ class LlamaCppPromptGen:
         auto_retry        = _kw("🔁 auto_retry",      "auto_retry",        default=False)
         seed              = _kw("🌱 seed",             "seed",              default=0)
         vram_management   = _kw("🔌 vram_management", "vram_management",   default="auto_unload (safe)")
+        prompt_style_preset = _kw("🧩 prompt_style_preset", "prompt_style_preset", default="Plain")
+        legacy_use_custom_system_prompt = _kw("🧩 use_custom_system_prompt", "use_custom_system_prompt", default=False)
+        custom_prompt_format = _kw("🧾 custom_prompt_format", "custom_prompt_format", "🧾 custom_system_prompt", "custom_system_prompt", default="")
         llama_server_url  = _kw("🖥️ llama_server_url","llama_server_url",  default="http://127.0.0.1:8080")
         gguf_model        = _kw("🧠 gguf_model",      "gguf_model",        default="")
 
@@ -2626,6 +2673,13 @@ class LlamaCppPromptGen:
             "None",
             legacy_map={"": "None"},
         )
+        prompt_style_preset = _normalise_choice(
+            prompt_style_preset,
+            set(PROMPT_STYLE_PRESETS),
+            "Plain",
+        )
+        if legacy_use_custom_system_prompt and prompt_style_preset == "Plain":
+            prompt_style_preset = "Custom"
 
         if not llama_server_url or not llama_server_url.strip():
             llama_server_url = "http://127.0.0.1:8080"
@@ -2783,6 +2837,13 @@ class LlamaCppPromptGen:
             # Build message
             system_prompt = get_system_prompt(target_model, screenplay_mode, animation_preset,
                                               transform_mode=transform_mode)
+            if prompt_style_preset == "LTX Vision/Audio":
+                system_prompt = LTX_VISION_AUDIO_SYSTEM_PROMPT
+            elif prompt_style_preset == "Custom":
+                if isinstance(custom_prompt_format, str) and custom_prompt_format.strip():
+                    system_prompt = custom_prompt_format.strip()
+                else:
+                    return ("❌ Custom prompt format preset selected, but no custom format text was provided.", "", "", "",)
             combined = self._build_message(
                 instruction, system_prompt, target_model, environment,
                 frame_count, dialogue, character, seed, image_paths,
