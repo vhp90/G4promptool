@@ -42,22 +42,19 @@ DEFAULT_GGUF_FILENAME = "nsfwvision_v5-Q4_K_M.gguf"
 DEFAULT_MMPROJ_FILENAME = "mmproj-nsfwvision_v5.gguf"
 PROMPT_STYLE_PRESETS = ["Plain", "LTX Vision/Audio", "Custom"]
 
-LTX_VISION_AUDIO_SYSTEM_PROMPT = """You generate prompts for LTX video in one strict format only.
+LTX_VISION_AUDIO_SYSTEM_PROMPT = """Output exactly this format and nothing else:
 
-Output exactly these two sections and nothing else:
+[VISUAL]:
+<visual prompt>
 
-vision:
-<the full visual prompt>
-
-audio:
-<the full audio prompt>
+[AUDIO]:
+<audio prompt>
 
 Rules:
-- Keep the section labels exactly as 'vision:' and 'audio:'
-- Do not add any preamble, explanation, markdown, or extra sections
-- Put all visual direction, action, camera, scene, and subject details inside the vision section
-- Put all sound, ambience, dialogue, voice, music, and sonic details inside the audio section
-- Never merge the two sections together
+- Keep the labels exactly as [VISUAL]: and [AUDIO]:
+- Put scene, subject, motion, camera, lighting, environment, and visual style only in [VISUAL]:
+- Put ambience, dialogue, voice, music, and sound design only in [AUDIO]:
+- No explanation, markdown fences, bullets, or extra sections
 """
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2140,12 +2137,74 @@ def get_system_prompt(target_model: str, screenplay_mode: bool = False,
     return base
 
 
+def get_minimal_system_prompt(target_model: str, screenplay_mode: bool = False,
+                              animation_preset: str = "None",
+                              transform_mode: bool = False) -> str:
+    if "LTX" in target_model:
+        base = (
+            "Write only the final prompt. "
+            "Focus on concrete visible action, camera, lighting, environment, and sound. "
+            "No explanation, no markdown, no filler."
+        )
+        if screenplay_mode:
+            base = (
+                "Write only the final screenplay-style prompt. "
+                "No headings, no explanation, no filler. "
+                "Keep each block practical and scene-specific."
+            )
+    elif "Wan" in target_model:
+        base = (
+            "Write only the final prompt. "
+            "Focus on subject, scene, motion, camera, and lighting. "
+            "No explanation, no markdown, no filler."
+        )
+    elif "Flux" in target_model:
+        base = (
+            "Write one natural-language image prompt only. "
+            "Put subject first, then action or pose, environment, lighting, and style. "
+            "No explanation or markdown."
+        )
+    elif "SDXL" in target_model:
+        base = "Output only this format:\nPOSITIVE:\n<comma-separated prompt tags>\n\nNEGATIVE:\n<comma-separated negative tags>"
+    elif "Pony" in target_model:
+        base = "Output only this format:\nPOSITIVE:\n<comma-separated booru tags>\n\nNEGATIVE:\n<comma-separated negative tags>"
+    elif "SD 1.5" in target_model:
+        base = "Output only this format:\nPOSITIVE:\n<weighted prompt>\n\nNEGATIVE:\n<negative prompt>"
+    else:
+        base = "Write only the final prompt. No explanation, no markdown, no filler."
+
+    if transform_mode:
+        base += (
+            "\nTreat the request as style transfer from an existing source clip. "
+            "Focus on the target look and rendering style, not on inventing new scene events."
+        )
+
+    if animation_preset and animation_preset != "None" and not transform_mode:
+        preset = ANIMATION_PRESETS.get(animation_preset)
+        if preset:
+            style_tag = preset.get("style_tag", "")
+            if style_tag:
+                base += f"\nStart the visual description with this style anchor: {style_tag}"
+
+    return base
+
+
 def is_video_model(target_model: str) -> bool:
     return "LTX" in target_model or "Wan" in target_model
 
 
 def has_audio(target_model: str) -> bool:
     return "LTX" in target_model
+
+
+def plain_output_instruction(target_model: str) -> str:
+    if "SDXL" in target_model or "Pony" in target_model or "SD 1.5" in target_model:
+        return "Output only the prompt in the required POSITIVE/NEGATIVE format. No explanation."
+    if "Flux" in target_model:
+        return "Output one natural-language image prompt only. No headers. No bullets. No explanation."
+    if is_video_model(target_model):
+        return "Output one final prompt only. No headers. No bullets. No explanation."
+    return "Output the final prompt only. No explanation."
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2299,6 +2358,10 @@ class LlamaCppPromptGen:
     _selected_model_name = _PREFERRED_GGUF
     _model_traits = _infer_model_traits(_PREFERRED_GGUF)
     _vision_enabled = False
+    _prompt_style_preset = "Plain"
+    _character_prefix = ""
+    _active_model_stem = None
+    _active_vision_enabled = False
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2680,6 +2743,11 @@ class LlamaCppPromptGen:
         )
         if legacy_use_custom_system_prompt and prompt_style_preset == "Plain":
             prompt_style_preset = "Custom"
+        self._prompt_style_preset = prompt_style_preset
+        self._character_prefix = character.strip() if isinstance(character, str) else ""
+
+        if prompt_style_preset == "LTX Vision/Audio" and not is_video_model(target_model):
+            return ("❌ 'LTX Vision/Audio' prompt style preset is only supported for video targets like LTX or Wan.", "", "", "",)
 
         if not llama_server_url or not llama_server_url.strip():
             llama_server_url = "http://127.0.0.1:8080"
@@ -2835,8 +2903,8 @@ class LlamaCppPromptGen:
             _temperature_float = _temp_map.get(temperature, 1.0)
 
             # Build message
-            system_prompt = get_system_prompt(target_model, screenplay_mode, animation_preset,
-                                              transform_mode=transform_mode)
+            system_prompt = get_minimal_system_prompt(target_model, screenplay_mode, animation_preset,
+                                                      transform_mode=transform_mode)
             if prompt_style_preset == "LTX Vision/Audio":
                 system_prompt = LTX_VISION_AUDIO_SYSTEM_PROMPT
             elif prompt_style_preset == "Custom":
@@ -2852,11 +2920,49 @@ class LlamaCppPromptGen:
                 image_mode=image_mode, transform_mode=transform_mode
             )
 
+            def _generate_candidate(temp_value):
+                candidate_neg = ""
+                candidate_prompt = self._call_llama(
+                    combined, system_prompt, llama_server_url, image_paths,
+                    frame_count, target_model, word_target,
+                    temperature_override=temp_value
+                )
+                candidate_prompt, candidate_neg = self._clean_output(
+                    candidate_prompt,
+                    screenplay_mode=(screenplay_mode and "LTX" in target_model)
+                )
+                candidate_prompt = self._apply_prompt_style_postprocess(candidate_prompt)
+                if not candidate_prompt.startswith("❌") and not candidate_prompt.startswith("⚠️") and not candidate_prompt.strip():
+                    candidate_prompt = "⚠️ Model returned a blank prompt after cleaning. Re-queue to retry."
+                return candidate_prompt, candidate_neg
+
+            def _is_retryable_format_failure(candidate_prompt: str) -> bool:
+                retryable_markers = (
+                    "did not follow the required [VISUAL]: / [AUDIO]: format",
+                    "empty [VISUAL] section",
+                    "empty [AUDIO] section",
+                    "blank prompt after cleaning",
+                )
+                lowered = candidate_prompt.lower()
+                return candidate_prompt.startswith("⚠️") and any(marker.lower() in lowered for marker in retryable_markers)
+
             # Generate
             neg_prompt = ""   # will be populated by _clean_output if model outputs NEGATIVE: block
-            prompt = self._call_llama(combined, system_prompt, llama_server_url, image_paths,
-                                      frame_count, target_model, word_target,
-                                      temperature_override=_temperature_float)
+            prompt, neg_prompt = _generate_candidate(_temperature_float)
+
+            if prompt_style_preset in ("LTX Vision/Audio", "Custom") and _is_retryable_format_failure(prompt):
+                last_error = prompt
+                for retry_idx in range(2):
+                    retry_temp = min(1.4, _temperature_float + 0.15 * (retry_idx + 1))
+                    print(f"[Gemma4PromptGen] Strict format attempt {retry_idx + 2}/3 after formatting failure...")
+                    retry_prompt, retry_neg = _generate_candidate(retry_temp)
+                    if not _is_retryable_format_failure(retry_prompt):
+                        prompt = retry_prompt
+                        neg_prompt = retry_neg
+                        break
+                    last_error = retry_prompt
+                else:
+                    prompt = last_error
 
             # Clean up temp images
             for p in image_paths:
@@ -2865,13 +2971,6 @@ class LlamaCppPromptGen:
                         os.unlink(p)
                     except Exception:
                         pass
-
-            prompt, neg_prompt = self._clean_output(prompt, screenplay_mode=(screenplay_mode and "LTX" in target_model))
-
-            # Guard: if cleaning stripped everything (e.g. model only emitted junk/labels),
-            # surface a clear retryable error rather than passing a blank string downstream
-            if not prompt.startswith("❌") and not prompt.startswith("⚠️") and not prompt.strip():
-                prompt = "⚠️ Model returned a blank prompt after cleaning. Re-queue to retry."
 
             # ── Quality check + optional auto-retry ──────────────────────
             qc_report = ""
@@ -2883,15 +2982,7 @@ class LlamaCppPromptGen:
 
                 if not qc_passed and auto_retry:
                     print(f"[Gemma4PromptGen] QC failed ({qc_score}/100) — firing retry with boosted temperature...")
-                    retry_prompt = self._call_llama(
-                        combined, system_prompt, llama_server_url, None,
-                        frame_count, target_model, word_target,
-                        temperature_override=min(1.4, _temperature_float + 0.2)
-                    )
-                    retry_prompt, retry_neg = self._clean_output(
-                        retry_prompt,
-                        screenplay_mode=(screenplay_mode and "LTX" in target_model)
-                    )
+                    retry_prompt, retry_neg = _generate_candidate(min(1.4, _temperature_float + 0.2))
                     if not retry_prompt.startswith("❌") and not retry_prompt.startswith("⚠️"):
                         _, retry_report, retry_score = self._check_prompt_quality(
                             retry_prompt, dialogue, energy, frame_count, target_model
@@ -3007,7 +3098,7 @@ class LlamaCppPromptGen:
                        animation_preset="None", energy="Intense",
                        style_preset="None", word_target=0, content_gate="Auto",
                        image_mode="none", transform_mode=False):
-        """Assemble the full prompt message for Claude Code."""
+        """Assemble the dynamic user-context message only."""
 
         parts = []
 
@@ -3017,10 +3108,6 @@ class LlamaCppPromptGen:
         model_traits = getattr(self, "_model_traits", {})
         if model_traits.get("supports_no_think"):
             parts.append("/no_think\n")
-
-        parts.append("Read and follow these instructions carefully:\n")
-        parts.append(system_prompt)
-        parts.append("\n---\n")
 
         # ── Content gate — hard override injected before everything else ─
         if content_gate == "SFW":
@@ -3436,7 +3523,9 @@ class LlamaCppPromptGen:
 
         # Character lock
         if character and character.strip():
-            if is_video_model(target_model):
+            if getattr(self, "_prompt_style_preset", "Plain") == "LTX Vision/Audio" and "LTX" in target_model:
+                pass
+            elif is_video_model(target_model):
                 parts.append(
                     f"CHARACTER (use this exactly — anchor words in sentence 1 and optionally at midpoint): "
                     f"{character.strip()}\n"
@@ -3719,9 +3808,29 @@ class LlamaCppPromptGen:
         else:
             word_instruction = ""
 
+        prompt_style_preset = getattr(self, "_prompt_style_preset", "Plain")
+
         # ── Transform mode — wrap instruction with vid2vid context ─────
         # The full transform ruleset is already in the system prompt preamble.
         # Here we just label the instruction as a style direction and cue output.
+        if prompt_style_preset == "LTX Vision/Audio" and not transform_mode:
+            parts.append(
+                "SCENE TO WRITE A PROMPT FOR:\n"
+                + instruction
+                + word_instruction
+                + "\n\nUse the required [VISUAL]/[AUDIO] output format exactly."
+            )
+            return "\n".join(parts)
+
+        if prompt_style_preset == "Custom" and not transform_mode:
+            parts.append(
+                "SCENE TO WRITE A PROMPT FOR:\n"
+                + instruction
+                + word_instruction
+                + "\n\nUse the required custom output format exactly."
+            )
+            return "\n".join(parts)
+
         if transform_mode:
             parts.append(
                 "TARGET STYLE DIRECTION:\n"
@@ -3736,8 +3845,8 @@ class LlamaCppPromptGen:
                 "SCENE TO WRITE A PROMPT FOR:\n"
                 + instruction
                 + word_instruction
-                + "\n\nOutput the prompt now. One paragraph. No headers. No bullets. No preamble. "
-                "The first word you write is the first word of the cinematic paragraph itself. Begin:"
+                + "\n\n"
+                + plain_output_instruction(target_model)
             )
 
         return "\n".join(parts)
@@ -3774,6 +3883,9 @@ class LlamaCppPromptGen:
             r"^this prompt\s",
             r"^the prompt\s",
             r"^prompt:",
+            r"^you are\b",
+            r"^write only\b",
+            r"^output only\b",
             r"^#+\s",            # markdown header
             r"^\*\*\w.*\*\*\s*$",  # standalone bold label line
         ]
@@ -3949,6 +4061,9 @@ class LlamaCppPromptGen:
             r"^Let me\s",
             r"^Sure",
             r"^Of course",
+            r"^You are\b",
+            r"^Write only\b",
+            r"^Output only\b",
             # Arc/section label echoes
             r"^opening arc\s*$",
             r"^middle arc\s*$",
@@ -3991,6 +4106,40 @@ class LlamaCppPromptGen:
 
         return text, neg_prompt
 
+    def _apply_prompt_style_postprocess(self, text: str) -> str:
+        if text.startswith("❌") or text.startswith("⚠️"):
+            return text
+
+        preset = getattr(self, "_prompt_style_preset", "Plain")
+        if preset != "LTX Vision/Audio":
+            return text
+
+        character_prefix = getattr(self, "_character_prefix", "").strip()
+
+        normalised = text.replace("[Visual]:", "[VISUAL]:").replace("[Audio]:", "[AUDIO]:")
+        normalised = re.sub(r"(?im)^\s*visual\s*:\s*", "[VISUAL]: ", normalised)
+        normalised = re.sub(r"(?im)^\s*audio\s*:\s*", "[AUDIO]: ", normalised)
+
+        visual_match = re.search(r"(?is)\[VISUAL\]\s*:\s*(.*?)(?=\n\s*\[AUDIO\]\s*:|$)", normalised)
+        audio_match = re.search(r"(?is)\[AUDIO\]\s*:\s*(.*)$", normalised)
+
+        if not visual_match or not audio_match:
+            return "⚠️ Model did not follow the required [VISUAL]: / [AUDIO]: format. Re-queue to retry."
+
+        visual_text = visual_match.group(1).strip()
+        audio_text = audio_match.group(1).strip()
+
+        if not visual_text:
+            return "⚠️ Model returned an empty [VISUAL] section. Re-queue to retry."
+        if not audio_text:
+            return "⚠️ Model returned an empty [AUDIO] section. Re-queue to retry."
+
+        if character_prefix:
+            if not visual_text.lower().startswith(character_prefix.lower()):
+                visual_text = f"{character_prefix}, {visual_text}"
+
+        return f"[VISUAL]: {visual_text}\n\n[AUDIO]: {audio_text}".strip()
+
     def _resolve_server_model_id(self, server_url: str) -> str:
         fallback = getattr(self, "_server_model_id", _model_basename(getattr(self, "_selected_model_name", "")) or "llama")
         try:
@@ -4006,6 +4155,20 @@ class LlamaCppPromptGen:
         except Exception:
             pass
         return fallback
+
+    def _fetch_server_model_id(self, server_url: str) -> str | None:
+        try:
+            req = urllib.request.Request(f"{server_url}/v1/models", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            data = payload.get("data") or []
+            if data and isinstance(data, list):
+                model_id = data[0].get("id")
+                if model_id:
+                    return model_id
+        except Exception:
+            pass
+        return None
 
     # ── llama-server call ─────────────────────────────────────────────────
 
@@ -4060,22 +4223,10 @@ class LlamaCppPromptGen:
 
         model_id = self._resolve_server_model_id(server_url)
 
-        # Scale max_tokens — word_target wins if set, otherwise scale with duration
+        # Only constrain output length when the user explicitly asks for a word count.
         if word_target > 0:
-            # words * 1.5 = safe token headroom (English avg ~0.75 tokens/word)
-            # add 200 buffer for any thinking/preamble the model emits
-            max_tok = int(word_target * 1.5) + 200
+            max_tok = int(word_target * 4) + 512
             print(f'[Gemma4PromptGen] word_target={word_target} -> max_tokens={max_tok}')
-        else:
-            duration_sec = round(frame_count / 25.0, 1) if is_video_model(target_model) else 0
-            if duration_sec >= 30:
-                max_tok = 1400
-            elif duration_sec >= 20:
-                max_tok = 1100
-            elif duration_sec >= 10:
-                max_tok = 900
-            else:
-                max_tok = 700
 
         payload = {
             "model": model_id,
@@ -4086,9 +4237,10 @@ class LlamaCppPromptGen:
             "temperature": temperature_override,
             "top_p": 0.95,
             "top_k": 64,
-            "max_tokens": max_tok,
             "stream": False,
         }
+        if word_target > 0:
+            payload["max_tokens"] = max_tok
 
         try:
             data = json.dumps(payload).encode("utf-8")
@@ -4258,15 +4410,13 @@ class LlamaCppPromptGen:
         """Boot llama-server if not already running, wait for health check.
         Auto-detects mmproj file alongside the GGUF and passes --mmproj if found.
         """
-        if self._check_health(server_url):
-            return "✅ llama-server already running"
-
         if not os.path.isfile(llama_exe):
             return f"❌ llama-server not found at: {llama_exe}"
         if not os.path.isfile(model_path):
             return f"❌ Model GGUF not found at: {model_path}"
 
         self._server_model_id = _model_basename(model_path)
+        desired_model_stem = _model_stem(model_path)
 
         # Auto-detect a matching mmproj in models directory — only if use_image is enabled
         mmproj_path = None
@@ -4275,16 +4425,26 @@ class LlamaCppPromptGen:
             if mmproj_path:
                 print(f"[Gemma4PromptGen] mmproj found: {mmproj_path} — vision enabled")
             else:
-                print("[Gemma4PromptGen] no matching mmproj found — falling back to text-only mode")
+                return "❌ Image input was requested, but no matching mmproj GGUF was found for the selected model."
         else:
             print("[Gemma4PromptGen] use_image is OFF — skipping mmproj, text-only mode")
         self._vision_enabled = bool(mmproj_path)
+
+        if self._check_health(server_url):
+            current_model_id = self._fetch_server_model_id(server_url)
+            current_model_stem = _model_stem(current_model_id or "")
+            current_vision_enabled = bool(getattr(LlamaCppPromptGen, "_active_vision_enabled", False))
+            if current_model_stem == desired_model_stem and current_vision_enabled == self._vision_enabled:
+                self._server_model_id = current_model_id or self._server_model_id
+                return "✅ llama-server already running for the selected model"
+
+            print("[Gemma4PromptGen] Existing llama-server does not match the selected model/settings — restarting it now.")
+            self._kill_llama_server()
 
         cmd_base = [
             llama_exe,
             "-m", model_path,
             "-ngl", "99",
-            "--ctx-size", "32768",
         ]
         if mmproj_path:
             cmd_base += ["--mmproj", mmproj_path]
@@ -4349,12 +4509,16 @@ class LlamaCppPromptGen:
                     return f"❌ llama-server exited before becoming healthy (code {proc.returncode}).{suffix}"
                 if self._check_health(server_url):
                     self._server_model_id = self._resolve_server_model_id(server_url)
+                    LlamaCppPromptGen._active_model_stem = desired_model_stem
+                    LlamaCppPromptGen._active_vision_enabled = self._vision_enabled
                     return f"✅ llama-server started ({waited}s){' — vision enabled' if mmproj_path else ''}"
                 time.sleep(2)
                 waited += 2
 
             if self._check_health(server_url):
                 self._server_model_id = self._resolve_server_model_id(server_url)
+                LlamaCppPromptGen._active_model_stem = desired_model_stem
+                LlamaCppPromptGen._active_vision_enabled = self._vision_enabled
                 return f"✅ llama-server started ({waited}s){' — vision enabled' if mmproj_path else ''}"
 
             last_tail = _llama_log_tail(Gemma4PromptGen._llama_log_path)
@@ -4401,6 +4565,8 @@ class LlamaCppPromptGen:
             except Exception:
                 pass
         Gemma4PromptGen._llama_process = None
+        LlamaCppPromptGen._active_model_stem = None
+        LlamaCppPromptGen._active_vision_enabled = False
         if Gemma4PromptGen._llama_log_handle is not None:
             try:
                 Gemma4PromptGen._llama_log_handle.close()
