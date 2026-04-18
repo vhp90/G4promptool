@@ -38,7 +38,7 @@ import urllib.request
 import urllib.error
 
 DEFAULT_HF_REPO = "GitMylo/nsfwvision-v5_qwen3.5-9b-gguf"
-DEFAULT_GGUF_FILENAME = "nsfwvision_v5-Q4_K_M.gguf"
+DEFAULT_GGUF_FILENAME = "nsfwvision_v5-fp16.gguf"
 DEFAULT_MMPROJ_FILENAME = "mmproj-nsfwvision_v5.gguf"
 PROMPT_STYLE_PRESETS = ["Plain", "LTX Vision/Audio", "Custom"]
 

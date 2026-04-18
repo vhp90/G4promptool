@@ -1,6 +1,6 @@
 {
   "hf_repo": "GitMylo/nsfwvision-v5_qwen3.5-9b-gguf",
-  "gguf_filename": "nsfwvision_v5-Q4_K_M.gguf",
+  "gguf_filename": "nsfwvision_v5-fp16.gguf",
   "mmproj_filename": "mmproj-nsfwvision_v5.gguf",
   "build_max_workers": true
 }
