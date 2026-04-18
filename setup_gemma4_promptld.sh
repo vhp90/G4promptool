@@ -52,7 +52,12 @@ first_match() {
 
 install_python_packages() {
     if command -v uv >/dev/null 2>&1; then
-        uv pip install --python python3 "$@"
+        PYTHON_TARGET="$(command -v python3 || true)"
+        if [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; then
+            uv pip install --python "${PYTHON_TARGET:-python3}" "$@"
+        else
+            uv pip install --system --python "${PYTHON_TARGET:-python3}" "$@"
+        fi
     else
         pip install "$@"
     fi
