@@ -16,6 +16,10 @@
    ```bash
    ./setup_gemma4_promptld.sh
    ```
+   For automation or non-interactive setup, use:
+   ```bash
+   ./setup_gemma4_promptld.sh --yes
+   ```
 5. Wait for the setup to finish downloading (auto-detects and uses high-speed `hf transfer` if supported).
 6. Restart ComfyUI.
 7. Add the **llama.cpp Prompt Engineer** node in ComfyUI, configure your inputs, and run your workflow!

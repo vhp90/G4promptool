@@ -13,6 +13,31 @@
 
 set -euo pipefail
 
+AUTO_DOWNLOAD="${G4PROMPTOOL_AUTO_DOWNLOAD:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --yes|--download)
+            AUTO_DOWNLOAD="y"
+            shift
+            ;;
+        --no-download|--skip-download)
+            AUTO_DOWNLOAD="n"
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--yes|--download] [--no-download|--skip-download]"
+            echo "  --yes / --download    Automatically download missing GGUF + mmproj files"
+            echo "  --no-download         Skip missing model downloads without prompting"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
 # ── ANSI COLOURS ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -23,6 +48,14 @@ NC='\033[0m' # No Colour
 
 first_match() {
     find "$@" -print -quit 2>/dev/null
+}
+
+install_python_packages() {
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python python3 "$@"
+    else
+        pip install "$@"
+    fi
 }
 
 download_prebuilt_llama() {
@@ -264,7 +297,16 @@ else
     echo ""
     echo "Configured model: ${HF_REPO} -> ${GGUF_FILE_NAME}"
     echo ""
-    read -p "Download both now? (y/n): " DOWNLOAD_GGUF
+    if [ -z "${AUTO_DOWNLOAD}" ] && [ ! -t 0 ]; then
+        AUTO_DOWNLOAD="y"
+    fi
+
+    if [ -n "${AUTO_DOWNLOAD}" ]; then
+        DOWNLOAD_GGUF="${AUTO_DOWNLOAD}"
+        echo "Auto download choice: ${DOWNLOAD_GGUF}"
+    else
+        read -r -p "Download both now? (y/n): " DOWNLOAD_GGUF
+    fi
 
     if [[ "${DOWNLOAD_GGUF,,}" == "y" ]]; then
         echo ""
@@ -273,7 +315,7 @@ else
         export HF_HUB_ENABLE_HF_TRANSFER=1
         if ! python3 -c "import huggingface_hub, hf_transfer" 2>/dev/null; then
             echo "Installing hf_transfer for max download speed (Rust)..."
-            pip install -q hf_transfer huggingface_hub
+            install_python_packages -q hf_transfer huggingface_hub
         fi
         
         echo ""
@@ -325,7 +367,7 @@ if python3 -c "import requests" 2>/dev/null; then
     echo -e "${GREEN}✅ requests already installed.${NC}"
 else
     echo "Installing requests..."
-    pip install requests
+    install_python_packages requests
 fi
 
 # Ensure Pillow is available (needed for image encoding)
@@ -333,7 +375,7 @@ if python3 -c "from PIL import Image" 2>/dev/null; then
     echo -e "${GREEN}✅ Pillow already installed.${NC}"
 else
     echo "Installing Pillow..."
-    pip install Pillow
+    install_python_packages Pillow
 fi
 
 # ── STEP 4/4: Install CUDA dependencies for llama.cpp ──────────────────────
